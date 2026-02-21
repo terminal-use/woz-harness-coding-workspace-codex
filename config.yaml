@@ -1,0 +1,43 @@
+# Coding Workspace Codex harness template.
+#
+# WOZ replaces {{HARNESS_AGENT_NAME}} during bootstrap.
+
+build:
+  context:
+    # This config.yaml is copied into the harness repo root during bootstrap, so the build
+    # context must be the repo root (not the parent directory).
+    root: .
+    include_paths:
+      - .
+    dockerfile: Dockerfile
+    dockerignore: .dockerignore
+
+agent:
+  name: {{HARNESS_AGENT_NAME}}
+  description: "WOZ harness agent (Coding Workspace Codex template)"
+  sdk_type: codex_agent_sdk
+
+sandbox:
+  code_dir: src
+
+deployment:
+  production:
+    replicaCount: 1
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "2Gi"
+      limits:
+        cpu: "3"
+        memory: "2Gi"
+    areTasksSticky: false
+  preview:
+    replicaCount: 1
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "2Gi"
+      limits:
+        cpu: "3"
+        memory: "2Gi"
+    areTasksSticky: false
