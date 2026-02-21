@@ -6,10 +6,12 @@ with planning, implementation, PR creation, and CI-fix loops using Codex.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
@@ -81,6 +83,7 @@ logger = make_logger(__name__)
 
 WORKSPACE_DIR = "/workspace"
 WORKSPACE_PATH = Path(WORKSPACE_DIR)
+WORKSPACE_GIT_PATH = WORKSPACE_PATH / ".git"
 AGENT_SRC_DIR = Path(__file__).resolve().parent
 BUNDLED_SKILLS_SOURCE_DIRS = (
     AGENT_SRC_DIR / "_embedded_skills",
@@ -89,6 +92,7 @@ BUNDLED_SKILLS_SOURCE_DIRS = (
     Path("/app/coding_workspace_codex/skills"),
 )
 WORKSPACE_SKILLS_DIR = WORKSPACE_PATH / ".codex" / "skills"
+DEFAULT_CODEX_MODEL = "gpt-5.2-codex"
 
 SYSTEM_PROMPT = """You are a coding assistant working in a repository at /workspace.
 
@@ -232,6 +236,68 @@ def _task_param_str(ctx: TaskContext, key: str) -> str | None:
     return None
 
 
+def _normalize_repo_identifier(value: str | None) -> str | None:
+    if not value:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+
+    if raw.startswith("git@github.com:"):
+        raw = raw.replace("git@github.com:", "https://github.com/", 1)
+
+    marker = "github.com/"
+    idx = raw.lower().find(marker)
+    if idx == -1:
+        return None
+
+    repo = raw[idx + len(marker) :]
+    if "@" in repo:
+        repo = repo.split("@", 1)[-1]
+    repo = repo.split("?", 1)[0].split("#", 1)[0].strip("/")
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+    if not repo:
+        return None
+    return repo.lower()
+
+
+def _workspace_remote_origin() -> str | None:
+    remote = _run(
+        ["git", "-C", WORKSPACE_DIR, "config", "--get", "remote.origin.url"],
+        timeout=10,
+        env=_git_env(),
+    )
+    if remote.returncode != 0:
+        return None
+    value = (remote.stdout or "").strip()
+    return value or None
+
+
+def _workspace_ready(expected_repo_url: str | None) -> bool:
+    if not WORKSPACE_GIT_PATH.exists():
+        return False
+    expected = _normalize_repo_identifier(expected_repo_url)
+    if not expected:
+        return True
+    origin = _normalize_repo_identifier(_workspace_remote_origin())
+    return origin == expected
+
+
+async def _wait_for_workspace_ready(
+    expected_repo_url: str | None,
+    *,
+    timeout_seconds: float = 45.0,
+    poll_seconds: float = 0.5,
+) -> bool:
+    deadline = time.monotonic() + max(1.0, timeout_seconds)
+    while time.monotonic() <= deadline:
+        if _workspace_ready(expected_repo_url):
+            return True
+        await asyncio.sleep(max(0.05, poll_seconds))
+    return _workspace_ready(expected_repo_url)
+
+
 def _gh_auth_ready() -> bool | None:
     """Return True/False when gh is installed; None when gh is unavailable."""
     if shutil.which("gh") is None:
@@ -340,6 +406,7 @@ async def handle_create(ctx: TaskContext, params: dict[str, Any]):
             "thread_id": None,
             "repo_url": repo_url,
             "github_auth_status": "pending" if github_token else "missing_token",
+            "workspace_ready": False,
         },
     )
 
@@ -432,7 +499,9 @@ async def handle_create(ctx: TaskContext, params: dict[str, Any]):
             ctx.task.id,
             github_auth_status,
         )
-        await ctx.state.update({"github_auth_status": github_auth_status})
+        await ctx.state.update(
+            {"github_auth_status": github_auth_status, "workspace_ready": True}
+        )
         if github_auth_status == "ready":
             await _send_status(
                 ctx,
@@ -477,6 +546,14 @@ async def handle_event(ctx: TaskContext, event: Event):
         thread_id = state.get("thread_id") if isinstance(state, dict) else None
         if not isinstance(thread_id, str):
             thread_id = None
+        expected_repo_url = None
+        if isinstance(state, dict):
+            state_repo = state.get("repo_url")
+            if isinstance(state_repo, str) and state_repo.strip():
+                expected_repo_url = state_repo.strip()
+        if not expected_repo_url:
+            expected_repo_url = _task_param_str(ctx, "repo_url")
+        workspace_ready_flag = bool(state.get("workspace_ready")) if isinstance(state, dict) else False
 
         github_auth_status = (
             state.get("github_auth_status") if isinstance(state, dict) else None
@@ -523,6 +600,32 @@ async def handle_event(ctx: TaskContext, event: Event):
             )
             await ctx.state.update({"github_auth_status": refreshed_github_auth_status})
 
+        if not workspace_ready_flag or not _workspace_ready(expected_repo_url):
+            logger.info(
+                "task_event_wait_workspace task_id=%s expected_repo=%s",
+                ctx.task.id,
+                expected_repo_url,
+            )
+            ready = await _wait_for_workspace_ready(expected_repo_url)
+            if not ready:
+                logger.warning(
+                    "workspace_wait_timeout task_id=%s expected_repo=%s origin=%s",
+                    ctx.task.id,
+                    expected_repo_url,
+                    _workspace_remote_origin(),
+                )
+                await ctx.messages.send(
+                    TurnFailedEvent(
+                        error=ThreadError(
+                            message=(
+                                "Workspace is still initializing. Please retry in a few seconds."
+                            )
+                        )
+                    )
+                )
+                return
+            await ctx.state.update({"workspace_ready": True})
+
         if not WORKSPACE_SKILLS_DIR.exists():
             skills_ready, skills_error = _install_workspace_skills()
             if skills_ready:
@@ -547,6 +650,11 @@ async def handle_event(ctx: TaskContext, event: Event):
                 "\nRuntime facts:\n"
                 "- No task-scoped GitHub token was provided."
             )
+        runtime_instructions += (
+            "\n- The repository for this task is already cloned at /workspace.\n"
+            "- Never use web_search to verify repository existence or access.\n"
+            "- Inspect and operate on local files in /workspace first."
+        )
 
         os.environ.setdefault("CODEX_HOME", "/root/.codex")
         resolved_thread_id = thread_id
@@ -561,6 +669,7 @@ async def handle_event(ctx: TaskContext, event: Event):
         codex_agent = Agent(
             name="Coding Workspace Codex Runtime",
             instructions=runtime_instructions,
+            model=(os.getenv("CODEX_MODEL", "").strip() or DEFAULT_CODEX_MODEL),
             model_settings=ModelSettings(tool_choice="required"),
             tools=[
                 codex_tool(
