@@ -1,5 +1,9 @@
 """Coding Workspace Codex Agent.
 
+Docs:
+- https://developers.openai.com/codex/guides/agents-sdk/
+- https://openai.github.io/openai-agents-python/tools/
+
 Clones a GitHub repo on task creation and runs Codex for coding assistance.
 """
 
@@ -10,17 +14,7 @@ import subprocess
 from typing import Any
 
 from agents import Agent, ModelSettings, Runner
-from agents.extensions.experimental.codex import (
-    CodexToolStreamEvent,
-    ThreadOptions,
-    codex_tool,
-)
-from agents.extensions.experimental.codex.events import (
-    ThreadError,
-    ThreadEvent,
-    ThreadStartedEvent,
-    TurnFailedEvent,
-)
+from agents.mcp import MCPServerStdio
 from terminaluse.lib import AgentServer, TaskContext, make_logger
 from terminaluse.types import Event, TextPart
 
@@ -40,13 +34,94 @@ from .helpers import (
 configure_runtime_logging()
 logger = make_logger(__name__)
 
-os.environ.setdefault("CODEX_HOME", "/root/.codex")   
+os.environ.setdefault("CODEX_HOME", "/root/.codex")
 
 DEFAULT_CODEX_MODEL = "gpt-5.3-codex"
 
-SYSTEM_PROMPT = """After you finish a task, create a commit, push to GitHub, and draft a PR."""
-
 server = AgentServer()
+
+
+def _state_thread_id(state: Any) -> str | None:
+    """Read thread_id from task state."""
+    if not isinstance(state, dict):
+        return None
+    value = state.get("thread_id")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _find_thread_id(value: Any, *, depth: int = 0, seen: set[int] | None = None) -> str | None:
+    """Recursively search for a thread id in mixed SDK result objects."""
+    if value is None or depth > 6:
+        return None
+
+    if isinstance(value, str):
+        return None
+
+    if seen is None:
+        seen = set()
+    value_id = id(value)
+    if value_id in seen:
+        return None
+    seen.add(value_id)
+
+    if isinstance(value, dict):
+        thread_id = value.get("threadId") or value.get("thread_id")
+        if isinstance(thread_id, str) and thread_id.strip():
+            return thread_id.strip()
+        for item in value.values():
+            found = _find_thread_id(item, depth=depth + 1, seen=seen)
+            if found:
+                return found
+        return None
+
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            found = _find_thread_id(item, depth=depth + 1, seen=seen)
+            if found:
+                return found
+        return None
+
+    for attr in ("thread_id", "threadId"):
+        if hasattr(value, attr):
+            thread_id = getattr(value, attr)
+            if isinstance(thread_id, str) and thread_id.strip():
+                return thread_id.strip()
+
+    for attr in ("final_output", "output", "raw_output", "content", "item", "result", "data", "payload"):
+        if hasattr(value, attr):
+            found = _find_thread_id(getattr(value, attr), depth=depth + 1, seen=seen)
+            if found:
+                return found
+
+    if hasattr(value, "__dict__"):
+        return _find_thread_id(vars(value), depth=depth + 1, seen=seen)
+
+    return None
+
+
+def _extract_thread_id_from_result(result: Any) -> str | None:
+    """Extract threadId from an Agent SDK run result."""
+    for attr in ("final_output", "new_items", "items", "output_items"):
+        found = _find_thread_id(getattr(result, attr, None))
+        if found:
+            return found
+    return None
+
+
+def _result_text(output: Any) -> str | None:
+    """Normalize run output into text for user-facing messages."""
+    if isinstance(output, str):
+        return output.strip() or None
+    if isinstance(output, dict):
+        content = output.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        text = output.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return None
 
 
 @server.on_create
@@ -62,7 +137,7 @@ async def handle_create(ctx: TaskContext, params: dict[str, Any]):
         bool(github_token),
     )
 
-    await ctx.state.create(state={"thread_id": None, "workspace_ready": False})
+    await ctx.state.create(state={"workspace_ready": False, "thread_id": None})
 
     if not repo_url:
         logger.error("missing_repo_url task_id=%s", ctx.task.id)
@@ -108,21 +183,17 @@ async def handle_create(ctx: TaskContext, params: dict[str, Any]):
 
 @server.on_event
 async def handle_event(ctx: TaskContext, event: Event):
-    """Handle user messages via Codex."""
+    """Handle user messages via Codex MCP server."""
     try:
         if not isinstance(event.content, TextPart):
-            await ctx.messages.send(
-                TurnFailedEvent(error=ThreadError(message="Only text messages supported."))
-            )
+            await ctx.messages.send("Only text messages supported.")
             return
 
         user_message = event.content.text
         logger.info("event task_id=%s chars=%s", ctx.task.id, len(user_message))
 
         state = await ctx.state.get()
-        thread_id = state.get("thread_id") if isinstance(state, dict) else None
-        if not isinstance(thread_id, str):
-            thread_id = None
+        prior_thread_id = _state_thread_id(state)
         workspace_ready_flag = bool(state.get("workspace_ready")) if isinstance(state, dict) else False
 
         task_github_token = task_param_str(ctx, "github_token")
@@ -133,56 +204,66 @@ async def handle_event(ctx: TaskContext, event: Event):
         if not workspace_ready_flag or not workspace_ready():
             ready = await wait_for_workspace_ready()
             if not ready:
-                await ctx.messages.send(
-                    TurnFailedEvent(error=ThreadError(message="Workspace still initializing. Retry soon."))
-                )
+                await ctx.messages.send("Workspace still initializing. Retry soon.")
                 return
             await ctx.state.update({"workspace_ready": True})
 
-        instructions = SYSTEM_PROMPT
-        if task_github_token:
-            instructions += "\nRuntime: GH_TOKEN configured. Verify with `gh auth status`."
-        else:
-            instructions += "\nRuntime: No GitHub token provided."
-        instructions += "\nRepo cloned at /workspace. Work with local files."
-
-        resolved_thread_id = thread_id
-
-        async def on_stream(payload: CodexToolStreamEvent) -> None:
-            nonlocal resolved_thread_id
-            thread_event: ThreadEvent = payload.event
-            await ctx.messages.send(thread_event)
-            if isinstance(thread_event, ThreadStartedEvent):
-                resolved_thread_id = thread_event.thread_id
-
-        agent = Agent(
-            name="Codex",
-            instructions=instructions,
-            model=os.getenv("CODEX_MODEL", "").strip() or DEFAULT_CODEX_MODEL,
-            model_settings=ModelSettings(tool_choice="required"),
-            tools=[
-                codex_tool(
-                    thread_id=thread_id,
-                    default_thread_options=ThreadOptions(
-                        working_directory=WORKSPACE_DIR,
-                        skip_git_repo_check=True,
-                        sandbox_mode="danger-full-access",
-                        approval_policy="never",
-                    ),
-                    on_stream=on_stream,
-                    failure_error_function=None,
-                )
-            ],
+        codex_mcp = MCPServerStdio(
+            name="Codex MCP",
+            params={
+                "command": "codex",
+                "args": [
+                    "mcp-server",
+                    "-c",
+                    'sandbox_mode="danger-full-access"',
+                    "-c",
+                    'approval_policy="never"',
+                ],
+            },
+            cache_tools_list=True,
         )
 
-        await Runner.run(agent, user_message)
+        instructions = (
+            "Use Codex MCP tools for coding tasks.\n"
+            "Call exactly one tool for each user message.\n"
+            "If `Current thread_id` is present below, call `codex-reply` with that exact `threadId`.\n"
+            "If it is absent, call `codex`.\n"
+            "Always set `prompt` to the user message.\n"
+        )
+        if prior_thread_id:
+            instructions += f"Current thread_id: {prior_thread_id}\n"
+        else:
+            instructions += "Current thread_id: none\n"
+        if task_github_token:
+            instructions += "Runtime: GH_TOKEN configured. Verify with `gh auth status`.\n"
+        else:
+            instructions += "Runtime: No GitHub token provided.\n"
+        instructions += "Repo cloned at /workspace. Work with local files."
 
-        if resolved_thread_id and resolved_thread_id != thread_id:
+        async with codex_mcp:
+            agent = Agent(
+                name="Codex",
+                instructions=instructions,
+                model=os.getenv("CODEX_MODEL", "").strip() or DEFAULT_CODEX_MODEL,
+                model_settings=ModelSettings(tool_choice="required"),
+                mcp_servers=[codex_mcp],
+            )
+            result = await Runner.run(agent, user_message)
+
+        resolved_thread_id = _extract_thread_id_from_result(result)
+        if resolved_thread_id and resolved_thread_id != prior_thread_id:
             await ctx.state.update({"thread_id": resolved_thread_id})
+            logger.info("thread_id_updated task_id=%s thread_id=%s", ctx.task.id, resolved_thread_id)
+
+        output = _result_text(result.final_output)
+        if output:
+            await ctx.messages.send(output)
+        else:
+            await ctx.messages.send("Codex completed without a text response.")
 
     except Exception as exc:
         logger.exception("event_error task_id=%s error=%s", ctx.task.id, exc)
-        await ctx.messages.send(TurnFailedEvent(error=ThreadError(message=str(exc))))
+        await ctx.messages.send(str(exc))
 
 
 @server.on_cancel

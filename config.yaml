@@ -13,7 +13,7 @@ build:
     dockerignore: .dockerignore
 
 agent:
-  name: {{HARNESS_AGENT_NAME}}
+  name: test/codex
   description: "WOZ harness agent (Coding Workspace Codex template)"
   sdk_type: codex_agent_sdk
 
