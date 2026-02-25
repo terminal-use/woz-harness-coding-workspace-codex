@@ -26,7 +26,7 @@ deployment:
     resources:
       requests:
         cpu: "250m"
-        memory: "2Gi"
+        memory: "500Mi"
       limits:
         cpu: "3"
         memory: "2Gi"
@@ -36,7 +36,7 @@ deployment:
     resources:
       requests:
         cpu: "250m"
-        memory: "2Gi"
+        memory: "500Mi"
       limits:
         cpu: "3"
         memory: "2Gi"
