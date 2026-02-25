@@ -24,7 +24,7 @@ from agents.extensions.experimental.codex.events import (
 from terminaluse.lib import AgentServer, TaskContext, make_logger
 from terminaluse.types import Event, TextPart
 
-from helpers import (
+from .helpers import (
     WORKSPACE_DIR,
     build_authenticated_clone_url,
     configure_git_identity,
@@ -32,7 +32,6 @@ from helpers import (
     git_env,
     redact_secret,
     run_cmd,
-    send_status,
     task_param_str,
     wait_for_workspace_ready,
     workspace_ready,
@@ -41,34 +40,11 @@ from helpers import (
 configure_runtime_logging()
 logger = make_logger(__name__)
 
+os.environ.setdefault("CODEX_HOME", "/root/.codex")   
+
 DEFAULT_CODEX_MODEL = "gpt-5.3-codex"
 
-SYSTEM_PROMPT = """You are a coding assistant working in a repository at /workspace.
-
-Core behavior:
-- Read the existing code before proposing edits.
-- Be concise, practical, and explicit about assumptions.
-- Prefer small, safe, testable changes.
-- Explain what you changed and why.
-
-When the user asks for a "plan":
-- Provide a short numbered plan first.
-- Update the plan as steps complete.
-
-When asked to get changes "PR-ready":
-1. Create a branch named `codex/<short-topic>`.
-2. Implement requested changes.
-3. Run relevant local checks (lint/tests/build).
-4. Commit with a clear message.
-5. Open or update a PR using `gh`.
-6. Check CI status using `gh pr checks` / `gh run`.
-7. If checks fail, inspect logs, fix, push, and repeat until green or blocked.
-8. End with PR URL, check status summary, and any remaining risks.
-
-GitHub tooling:
-- If `gh` is available and authenticated, use it for PRs and CI checks.
-- Never print or expose tokens in command output.
-"""
+SYSTEM_PROMPT = """After you finish a task, create a commit, push to GitHub, and draft a PR."""
 
 server = AgentServer()
 
@@ -89,12 +65,11 @@ async def handle_create(ctx: TaskContext, params: dict[str, Any]):
     await ctx.state.create(state={"thread_id": None, "workspace_ready": False})
 
     if not repo_url:
-        await send_status(ctx, "error", "Missing `repo_url` task param.")
+        logger.error("missing_repo_url task_id=%s", ctx.task.id)
         return
 
-    await send_status(ctx, "cloning", f"Cloning {repo_url} ...")
     if not github_token and isinstance(repo_url, str) and repo_url.startswith("https://github.com/"):
-        await send_status(ctx, "warning", "No GitHub token. Private repos may fail.")
+        logger.warning("no_github_token task_id=%s repo_url=%s", ctx.task.id, repo_url)
 
     try:
         clone_url, used_embedded_token = build_authenticated_clone_url(
@@ -112,7 +87,6 @@ async def handle_create(ctx: TaskContext, params: dict[str, Any]):
             if not github_token and "could not read Username" in stderr:
                 stderr = "Repository may be private. Reconnect GitHub and retry."
             logger.warning("clone_failed task_id=%s reason=%s", ctx.task.id, stderr)
-            await send_status(ctx, "error", f"Clone failed: {stderr}")
             return
 
         if used_embedded_token:
@@ -124,15 +98,12 @@ async def handle_create(ctx: TaskContext, params: dict[str, Any]):
             os.environ["GITHUB_TOKEN"] = str(github_token)
 
         await ctx.state.update({"workspace_ready": True})
-        await send_status(ctx, "ready", "Repository cloned successfully.")
         await ctx.messages.send("Workspace is ready.")
 
     except subprocess.TimeoutExpired:
         logger.warning("clone_timeout task_id=%s", ctx.task.id)
-        await send_status(ctx, "error", "Clone timed out.")
     except Exception as exc:
         logger.exception("clone_error task_id=%s error=%s", ctx.task.id, exc)
-        await send_status(ctx, "error", f"Clone error: {exc}")
 
 
 @server.on_event
@@ -175,7 +146,6 @@ async def handle_event(ctx: TaskContext, event: Event):
             instructions += "\nRuntime: No GitHub token provided."
         instructions += "\nRepo cloned at /workspace. Work with local files."
 
-        os.environ.setdefault("CODEX_HOME", "/root/.codex")
         resolved_thread_id = thread_id
 
         async def on_stream(payload: CodexToolStreamEvent) -> None:

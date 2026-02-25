@@ -8,9 +8,8 @@ import os
 import subprocess
 import time
 from pathlib import Path
-from typing import Literal, TypedDict
 
-from terminaluse.lib import DataPart, TaskContext, make_logger
+from terminaluse.lib import TaskContext, make_logger
 
 NOISY_RUNTIME_LOGGERS = (
     "httpx",
@@ -25,15 +24,6 @@ NOISY_RUNTIME_LOGGERS = (
 WORKSPACE_DIR = "/workspace"
 WORKSPACE_PATH = Path(WORKSPACE_DIR)
 WORKSPACE_GIT_PATH = WORKSPACE_PATH / ".git"
-
-AgentStatus = Literal["cloning", "warning", "error", "ready", "info"]
-
-
-class AgentStatusData(TypedDict):
-    kind: Literal["agent.status"]
-    v: Literal[1]
-    status: AgentStatus
-    message: str
 
 
 def _env_log_level(name: str, default: int) -> int:
@@ -148,24 +138,3 @@ async def wait_for_workspace_ready(
             return True
         await asyncio.sleep(max(0.05, poll_seconds))
     return workspace_ready()
-
-
-def _build_status_payload(status: AgentStatus, message: str) -> AgentStatusData:
-    return {
-        "kind": "agent.status",
-        "v": 1,
-        "status": status,
-        "message": message,
-    }
-
-
-async def send_status(ctx: TaskContext, status: AgentStatus, message: str) -> None:
-    """Send a status update to the client."""
-    payload = _build_status_payload(status, message)
-    logger.info(
-        "status_update task_id=%s status=%s message=%s",
-        ctx.task.id,
-        status,
-        message,
-    )
-    await ctx.messages.send(DataPart(data=payload))
