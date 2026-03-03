@@ -1,20 +1,22 @@
 """Coding Workspace Codex Agent.
 
-Docs:
-- https://developers.openai.com/codex/guides/agents-sdk/
-- https://openai.github.io/openai-agents-python/tools/
-
-Clones a GitHub repo on task creation and runs Codex for coding assistance.
+References:
+- https://developers.openai.com/codex/multi-agent
+- https://developers.openai.com/codex/mcp
+- https://developers.openai.com/codex/guides/agents-md
+- https://developers.openai.com/codex/config-basic
+- https://developers.openai.com/codex/config-advanced
+- https://developers.openai.com/codex/config-reference
+- https://developers.openai.com/codex/config-sample
 """
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from typing import Any
 
-from agents import Agent, ModelSettings, Runner
-from agents.mcp import MCPServerStdio
 from terminaluse.lib import AgentServer, TaskContext, make_logger
 from terminaluse.types import Event, TextPart
 
@@ -23,6 +25,7 @@ from .helpers import (
     build_authenticated_clone_url,
     configure_git_identity,
     configure_runtime_logging,
+    ensure_codex_cli_project_config,
     git_env,
     redact_secret,
     run_cmd,
@@ -36,13 +39,14 @@ logger = make_logger(__name__)
 
 os.environ.setdefault("CODEX_HOME", "/root/.codex")
 
-DEFAULT_CODEX_MODEL = "gpt-5.3-codex"
+DEFAULT_CODEX_MODEL = "codex-5.3-pro"
+CODEX_EXEC_TIMEOUT_SECONDS = 1800
 
 server = AgentServer()
 
 
 def _state_thread_id(state: Any) -> str | None:
-    """Read thread_id from task state."""
+    """Read persisted thread_id from task state."""
     if not isinstance(state, dict):
         return None
     value = state.get("thread_id")
@@ -51,77 +55,85 @@ def _state_thread_id(state: Any) -> str | None:
     return None
 
 
-def _find_thread_id(value: Any, *, depth: int = 0, seen: set[int] | None = None) -> str | None:
-    """Recursively search for a thread id in mixed SDK result objects."""
-    if value is None or depth > 6:
-        return None
+def _parse_codex_jsonl(stdout: str) -> tuple[str | None, str | None]:
+    """Extract thread_id and final assistant text from `codex exec --json` output."""
+    thread_id: str | None = None
+    last_message: str | None = None
 
-    if isinstance(value, str):
-        return None
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
 
-    if seen is None:
-        seen = set()
-    value_id = id(value)
-    if value_id in seen:
-        return None
-    seen.add(value_id)
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
 
-    if isinstance(value, dict):
-        thread_id = value.get("threadId") or value.get("thread_id")
-        if isinstance(thread_id, str) and thread_id.strip():
-            return thread_id.strip()
-        for item in value.values():
-            found = _find_thread_id(item, depth=depth + 1, seen=seen)
-            if found:
-                return found
-        return None
+        if event.get("type") == "thread.started":
+            candidate = event.get("thread_id")
+            if isinstance(candidate, str) and candidate.strip():
+                thread_id = candidate.strip()
 
-    if isinstance(value, (list, tuple, set)):
-        for item in value:
-            found = _find_thread_id(item, depth=depth + 1, seen=seen)
-            if found:
-                return found
-        return None
+        item = event.get("item")
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "agent_message":
+            continue
 
-    for attr in ("thread_id", "threadId"):
-        if hasattr(value, attr):
-            thread_id = getattr(value, attr)
-            if isinstance(thread_id, str) and thread_id.strip():
-                return thread_id.strip()
-
-    for attr in ("final_output", "output", "raw_output", "content", "item", "result", "data", "payload"):
-        if hasattr(value, attr):
-            found = _find_thread_id(getattr(value, attr), depth=depth + 1, seen=seen)
-            if found:
-                return found
-
-    if hasattr(value, "__dict__"):
-        return _find_thread_id(vars(value), depth=depth + 1, seen=seen)
-
-    return None
-
-
-def _extract_thread_id_from_result(result: Any) -> str | None:
-    """Extract threadId from an Agent SDK run result."""
-    for attr in ("final_output", "new_items", "items", "output_items"):
-        found = _find_thread_id(getattr(result, attr, None))
-        if found:
-            return found
-    return None
-
-
-def _result_text(output: Any) -> str | None:
-    """Normalize run output into text for user-facing messages."""
-    if isinstance(output, str):
-        return output.strip() or None
-    if isinstance(output, dict):
-        content = output.get("content")
-        if isinstance(content, str) and content.strip():
-            return content.strip()
-        text = output.get("text")
+        text = item.get("text")
         if isinstance(text, str) and text.strip():
-            return text.strip()
-    return None
+            last_message = text.strip()
+
+    return thread_id, last_message
+
+
+def _run_codex_cli(
+    *, prompt: str, model: str, thread_id: str | None, env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    """Run Codex CLI in non-interactive mode, optionally resuming a thread."""
+    if thread_id:
+        args = [
+            "codex",
+            "exec",
+            "resume",
+            "--json",
+            "-m",
+            model,
+            thread_id,
+            prompt,
+        ]
+    else:
+        args = [
+            "codex",
+            "exec",
+            "--json",
+            "-m",
+            model,
+            prompt,
+        ]
+
+    return run_cmd(
+        args,
+        cwd=WORKSPACE_DIR,
+        timeout=CODEX_EXEC_TIMEOUT_SECONDS,
+        env=env,
+    )
+
+
+def _error_text(result: subprocess.CompletedProcess[str], token: str | None) -> str:
+    """Build a user-facing error message from Codex CLI subprocess output."""
+    parts: list[str] = []
+    stderr = (result.stderr or "").strip()
+    stdout = (result.stdout or "").strip()
+
+    if stderr:
+        parts.append(stderr)
+    if stdout and not parts:
+        parts.append(stdout)
+
+    message = "\n".join(parts).strip() or "Codex CLI failed without output."
+    return redact_secret(message, token)[:8000]
 
 
 @server.on_create
@@ -172,7 +184,12 @@ async def handle_create(ctx: TaskContext, params: dict[str, Any]):
             os.environ["GH_TOKEN"] = str(github_token)
             os.environ["GITHUB_TOKEN"] = str(github_token)
 
-        await ctx.state.update({"workspace_ready": True})
+        model = os.getenv("CODEX_MODEL", "").strip() or DEFAULT_CODEX_MODEL
+        created = ensure_codex_cli_project_config(model=model)
+        if created:
+            logger.info("codex_config_initialized task_id=%s files=%s", ctx.task.id, created)
+
+        await ctx.state.update({"workspace_ready": True, "thread_id": None})
         await ctx.messages.send("Workspace is ready.")
 
     except subprocess.TimeoutExpired:
@@ -183,7 +200,7 @@ async def handle_create(ctx: TaskContext, params: dict[str, Any]):
 
 @server.on_event
 async def handle_event(ctx: TaskContext, event: Event):
-    """Handle user messages via Codex MCP server."""
+    """Handle user messages through Codex CLI (`codex exec`)."""
     try:
         if not isinstance(event.content, TextPart):
             await ctx.messages.send("Only text messages supported.")
@@ -197,9 +214,10 @@ async def handle_event(ctx: TaskContext, event: Event):
         workspace_ready_flag = bool(state.get("workspace_ready")) if isinstance(state, dict) else False
 
         task_github_token = task_param_str(ctx, "github_token")
+        env = git_env()
         if task_github_token:
-            os.environ["GH_TOKEN"] = task_github_token
-            os.environ["GITHUB_TOKEN"] = task_github_token
+            env["GH_TOKEN"] = task_github_token
+            env["GITHUB_TOKEN"] = task_github_token
 
         if not workspace_ready_flag or not workspace_ready():
             ready = await wait_for_workspace_ready()
@@ -208,56 +226,43 @@ async def handle_event(ctx: TaskContext, event: Event):
                 return
             await ctx.state.update({"workspace_ready": True})
 
-        codex_mcp = MCPServerStdio(
-            name="Codex MCP",
-            params={
-                "command": "codex",
-                "args": [
-                    "mcp-server",
-                    "-c",
-                    'sandbox_mode="danger-full-access"',
-                    "-c",
-                    'approval_policy="never"',
-                ],
-            },
-            cache_tools_list=True,
+        model = os.getenv("CODEX_MODEL", "").strip() or DEFAULT_CODEX_MODEL
+        ensure_codex_cli_project_config(model=model)
+
+        result = _run_codex_cli(
+            prompt=user_message,
+            model=model,
+            thread_id=prior_thread_id,
+            env=env,
         )
 
-        instructions = (
-            "Use Codex MCP tools for coding tasks.\n"
-            "Call exactly one tool for each user message.\n"
-            "If `Current thread_id` is present below, call `codex-reply` with that exact `threadId`.\n"
-            "If it is absent, call `codex`.\n"
-            "Always set `prompt` to the user message.\n"
-        )
-        if prior_thread_id:
-            instructions += f"Current thread_id: {prior_thread_id}\n"
-        else:
-            instructions += "Current thread_id: none\n"
-        if task_github_token:
-            instructions += "Runtime: GH_TOKEN configured. Verify with `gh auth status`.\n"
-        else:
-            instructions += "Runtime: No GitHub token provided.\n"
-        instructions += "Repo cloned at /workspace. Work with local files."
-
-        async with codex_mcp:
-            agent = Agent(
-                name="Codex",
-                instructions=instructions,
-                model=os.getenv("CODEX_MODEL", "").strip() or DEFAULT_CODEX_MODEL,
-                model_settings=ModelSettings(tool_choice="required"),
-                mcp_servers=[codex_mcp],
+        if result.returncode != 0 and prior_thread_id:
+            logger.warning(
+                "resume_failed task_id=%s thread_id=%s status=%s",
+                ctx.task.id,
+                prior_thread_id,
+                result.returncode,
             )
-            result = await Runner.run(agent, user_message)
+            await ctx.state.update({"thread_id": None})
+            result = _run_codex_cli(
+                prompt=user_message,
+                model=model,
+                thread_id=None,
+                env=env,
+            )
 
-        resolved_thread_id = _extract_thread_id_from_result(result)
+        if result.returncode != 0:
+            logger.warning("codex_exec_failed task_id=%s status=%s", ctx.task.id, result.returncode)
+            await ctx.messages.send(_error_text(result, task_github_token))
+            return
+
+        resolved_thread_id, output_text = _parse_codex_jsonl(result.stdout or "")
         if resolved_thread_id and resolved_thread_id != prior_thread_id:
             await ctx.state.update({"thread_id": resolved_thread_id})
             logger.info("thread_id_updated task_id=%s thread_id=%s", ctx.task.id, resolved_thread_id)
 
-        output = _result_text(result.final_output)
-        if output:
-            await ctx.messages.send(output)
+        if output_text:
+            await ctx.messages.send(output_text)
         else:
             await ctx.messages.send("Codex completed without a text response.")
 
