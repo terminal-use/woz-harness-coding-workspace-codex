@@ -2,11 +2,10 @@
 
 Minimal template for a repo-cloning coding workspace that runs Codex via the Codex CLI.
 
-## BIG NOTE
+## Note
 
-**To target Codex models (including `codex-5.3-pro`), this template uses Codex CLI config files.**
+**The SDK + MCP server path does not currently support the latest Codex models (including `codex-5.3-pro`), so this template uses Codex CLI instead.**
 
-- Do not rely on the SDK + MCP server path for `codex-5.3-pro`.
 - Use `.codex/config.toml` and per-agent config files as the source of truth.
 
 ## What this template does
