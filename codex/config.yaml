@@ -1,6 +1,0 @@
-# Vanilla Codex runtime settings used by this template.
-# This file is mounted to /workspace/.codex/config.yaml.
-
-model: codex-5.3-pro
-approval_policy: never
-sandbox_mode: danger-full-access

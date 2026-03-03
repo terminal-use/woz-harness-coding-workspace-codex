@@ -17,12 +17,6 @@ agent:
   description: "WOZ harness agent (Coding Workspace Codex template)"
   sdk_type: codex_agent_sdk
 
-sandbox:
-  mounts:
-    - source: codex/config.yaml
-      target: /workspace/.codex/config.yaml
-      readonly: true
-
 deployment:
   production:
     replicaCount: 1

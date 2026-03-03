@@ -1,0 +1,4 @@
+model = "codex-5.3-pro"
+model_reasoning_effort = "xhigh"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"

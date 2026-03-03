@@ -6,15 +6,15 @@ Minimal template for a repo-cloning coding workspace that runs Codex via the Cod
 
 **The SDK + MCP server path does not currently support the latest Codex models (including `codex-5.3-pro`), so this template uses Codex CLI instead.**
 
-- Use `codex/config.yaml` (baked to `/app/codex/config.yaml`) as the source of truth for Codex runtime settings.
+- Use baked `codex/config.toml` (`/app/codex/config.toml`) as the source of truth for Codex runtime settings.
 
 ## What this template does
 
 - Clones the target repository into `/workspace`.
 - Optionally boots GitHub CLI auth when a token is provided.
 - Supports optional `git_author_email` task param for commit author/committer email.
-- Mounts a vanilla Codex config file at `/workspace/.codex/config.yaml`.
-- Reads model/sandbox/approval settings from `/app/codex/config.yaml` in `on_event`.
+- Uses baked Codex config at `/app/codex/config.toml`.
+- Points Codex CLI to `/app/codex/config.toml` via `CODEX_HOME=/app/codex`.
 - Runs `codex exec` and `codex exec resume` (JSON mode) to preserve thread state across task events.
 
 ## Runtime
@@ -30,11 +30,11 @@ Minimal template for a repo-cloning coding workspace that runs Codex via the Cod
 - AGENTS.md guide: https://developers.openai.com/codex/guides/agents-md
 - Config basics: https://developers.openai.com/codex/config-basic
 - Config advanced: https://developers.openai.com/codex/config-advanced
-- Config reference: https://developers.openai.com/codex/config-reference
+- Config reference: https://developers.openai.com/codex/config-reference/
 - Config sample: https://developers.openai.com/codex/config-sample
 - Agents SDK guide (background/reference): https://developers.openai.com/codex/guides/agents-sdk/
 
-## Mounted Codex Config
+## Codex Config
 
-- Source in image: `/app/codex/config.yaml` (from repo path `codex/config.yaml`)
-- Mounted target: `/workspace/.codex/config.yaml` (configured in `config.yaml` sandbox mounts)
+- Source in image: `codex/config.toml` (from repo path `codex/config.toml`)
+- Runtime path: `/app/codex/config.toml`

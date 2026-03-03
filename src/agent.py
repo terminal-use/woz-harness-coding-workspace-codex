@@ -26,7 +26,6 @@ from .helpers import (
     configure_git_identity,
     configure_runtime_logging,
     git_env,
-    load_codex_runtime_config,
     redact_secret,
     run_cmd,
     task_param_str,
@@ -37,9 +36,7 @@ from .helpers import (
 configure_runtime_logging()
 logger = make_logger(__name__)
 
-os.environ.setdefault("CODEX_HOME", "/root/.codex")
-
-DEFAULT_CODEX_MODEL = "codex-5.3-pro"
+os.environ.setdefault("CODEX_HOME", "/app/codex")
 CODEX_EXEC_TIMEOUT_SECONDS = 1800
 
 server = AgentServer()
@@ -91,28 +88,19 @@ def _parse_codex_jsonl(stdout: str) -> tuple[str | None, str | None]:
 def _run_codex_cli(
     *,
     prompt: str,
-    model: str,
-    approval_policy: str,
-    sandbox_mode: str,
+    model: str | None,
     thread_id: str | None,
     env: dict[str, str],
 ) -> subprocess.CompletedProcess[str]:
     """Run Codex CLI in non-interactive mode, optionally resuming a thread."""
-    config_args = [
-        "-c",
-        f'approval_policy="{approval_policy}"',
-        "-c",
-        f'sandbox_mode="{sandbox_mode}"',
-    ]
+    model_args = ["-m", model] if model else []
     if thread_id:
         args = [
             "codex",
             "exec",
             "resume",
             "--json",
-            "-m",
-            model,
-            *config_args,
+            *model_args,
             thread_id,
             prompt,
         ]
@@ -121,9 +109,7 @@ def _run_codex_cli(
             "codex",
             "exec",
             "--json",
-            "-m",
-            model,
-            *config_args,
+            *model_args,
             prompt,
         ]
 
@@ -244,17 +230,12 @@ async def handle_event(ctx: TaskContext, event: Event):
                 return
             await ctx.state.update({"workspace_ready": True})
 
-        runtime_config = load_codex_runtime_config(default_model=DEFAULT_CODEX_MODEL)
-        model = os.getenv("CODEX_MODEL", "").strip() or runtime_config["model"]
-        approval_policy = runtime_config["approval_policy"]
-        sandbox_mode = runtime_config["sandbox_mode"]
+        model = os.getenv("CODEX_MODEL", "").strip() or None
         configure_git_identity(task_github_login, task_git_author_email)
 
         result = _run_codex_cli(
             prompt=user_message,
             model=model,
-            approval_policy=approval_policy,
-            sandbox_mode=sandbox_mode,
             thread_id=prior_thread_id,
             env=env,
         )
@@ -270,8 +251,6 @@ async def handle_event(ctx: TaskContext, event: Event):
             result = _run_codex_cli(
                 prompt=user_message,
                 model=model,
-                approval_policy=approval_policy,
-                sandbox_mode=sandbox_mode,
                 thread_id=None,
                 env=env,
             )
