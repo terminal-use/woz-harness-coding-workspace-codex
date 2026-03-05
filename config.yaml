@@ -38,3 +38,8 @@ deployment:
         cpu: "3"
         memory: "2Gi"
     areTasksSticky: false
+
+sandbox:
+  mounts:
+    source: codex
+    target: /root/.codex
