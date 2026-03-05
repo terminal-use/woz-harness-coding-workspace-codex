@@ -41,5 +41,5 @@ deployment:
 
 sandbox:
   mounts:
-    source: codex
-    target: /root/.codex
+    - source: codex
+      target: /root/.codex
